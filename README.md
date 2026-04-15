@@ -34,36 +34,40 @@ pip install -r requirements.txt
 
 ## Usage
 
-### SSN Mode (Default)
+### GUI Mode (Default)
 
-Redact Social Security Numbers from documents:
+Run without arguments to launch the graphical interface:
 
 ```bash
+python redact_ssns.py
+```
+
+The GUI provides:
+- File/folder selection with multi-select
+- Three redaction modes with descriptions
+- Progress bar and real-time log
+- Output directory selection
+- Cancel button to stop processing
+- Remembers your last settings
+
+### CLI Mode
+
+Use command-line arguments for scripting and automation:
+
+```bash
+# SSN Mode (Default)
 python redact_ssns.py statement.pdf
 python redact_ssns.py data.csv -v
-```
 
-### Bank Statement Mode
-
-Redact numbers, emails, phones, names, and addresses while **preserving currency amounts**:
-
-```bash
+# Bank Statement Mode - preserves $ amounts
 python redact_ssns.py bank_statement.pdf --mode bank
 python redact_ssns.py transactions.csv --mode bank -o ./redacted/
-```
 
-### Comprehensive Mode
-
-Redact everything (SSNs + bank patterns):
-
-```bash
+# Comprehensive Mode
 python redact_ssns.py document.pdf --mode all
 python redact_ssns.py ./documents/ --mode all --recursive
-```
 
-### Working with Excel Files
-
-```bash
+# Excel and batch processing
 python redact_ssns.py report.xlsx --mode bank
 python redact_ssns.py *.csv --mode all -v
 ```
@@ -73,12 +77,14 @@ python redact_ssns.py *.csv --mode all -v
 | Feature | Description |
 |---------|-------------|
 | **Multiple Formats** | PDF, CSV, TXT, XLSX support |
+| **GUI Interface** | tkinter-based desktop app (default when run without args) |
 | **Three Redaction Modes** | `ssn`, `bank`, `all` |
 | **OCR Support** | Handles scanned/image-based PDFs via Tesseract |
 | **Currency Preservation** | Dollar amounts like `$1,234.56` are kept in bank mode |
 | **Multi-Currency** | Supports `$`, `€`, `£`, `¥`, `₹`, `₩`, `¢` |
 | **Batch Processing** | Process entire directories recursively |
 | **Output Options** | Custom output directory or auto-naming |
+| **Progress Tracking** | Real-time progress bar and log in GUI mode |
 
 ## Redaction Patterns
 
@@ -103,12 +109,13 @@ Combines both SSN and bank pattern redaction.
 ## CLI Reference
 
 ```
-usage: redact_ssns.py [-h] [-r] [-v] [-o OUTPUT_DIR] [-m {ssn,bank,all}] path
+usage: redact_ssns.py [-h] [-r] [-v] [-o OUTPUT_DIR] [-m {ssn,bank,all}] [--gui] [path]
 
 Redact sensitive information from documents (PDF, CSV, TXT, XLSX).
 
 positional arguments:
   path                  File or directory to process (PDF, CSV, TXT, XLSX)
+                        (optional - launches GUI if not provided)
 
 options:
   -h, --help            show this help message and exit
@@ -118,11 +125,16 @@ options:
                         Output directory
   -m {ssn,bank,all}, --mode {ssn,bank,all}
                         Redaction mode (default: ssn)
+  --gui                 Launch GUI mode (default when run without args)
 
 Modes:
   ssn  - Redact Social Security Numbers only (default)
   bank - Redact numbers (except currency amounts), emails, phones, names, addresses
   all  - Redact both SSNs and bank patterns
+
+Notes:
+  - Running without arguments launches the GUI
+  - Use --gui flag to force GUI mode even with other arguments
 ```
 
 ## Examples

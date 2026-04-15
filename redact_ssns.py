@@ -624,7 +624,8 @@ def redact_file(file_path, output_path=None, mode="ssn", verbose=False):
 # ============================================================================
 
 
-def main():
+def cli_main():
+    """Command-line interface for redaction."""
     parser = argparse.ArgumentParser(
         description="Redact sensitive information from documents (PDF, CSV, TXT, XLSX).",
         epilog="""
@@ -633,12 +634,20 @@ Modes:
   bank - Redact numbers (except currency amounts), emails, phones, names, addresses
   all  - Redact both SSNs and bank patterns
 
-Currency amounts (e.g., $1,234.56, €500) are preserved in bank mode.
+Currency amounts (e.g. $1,234.56, €500) are preserved in bank mode.
+
+Examples:
+  python redact_ssns.py document.pdf
+  python redact_ssns.py statement.pdf --mode bank
+  python redact_ssns.py data/ --recursive --mode all -o ./redacted/
         """,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument(
-        "path", type=Path, help="File or directory to process (PDF, CSV, TXT, XLSX)"
+        "path",
+        type=Path,
+        nargs="?",  # Make path optional when launching GUI
+        help="File or directory to process (PDF, CSV, TXT, XLSX)",
     )
     parser.add_argument(
         "-r", "--recursive", action="store_true", help="Recurse into subdirectories"
@@ -656,8 +665,18 @@ Currency amounts (e.g., $1,234.56, €500) are preserved in bank mode.
         default="ssn",
         help="Redaction mode (default: ssn)",
     )
+    parser.add_argument(
+        "--gui",
+        action="store_true",
+        help="Launch GUI mode (default when no arguments provided)",
+    )
 
     args = parser.parse_args()
+
+    # Check if we should launch GUI
+    if args.gui or args.path is None:
+        launch_gui()
+        return
 
     target = args.path
     mode = args.mode
@@ -728,6 +747,35 @@ Currency amounts (e.g., $1,234.56, €500) are preserved in bank mode.
     print(
         f"\nDone: {total_files} file(s) processed, {total_redactions} {mode_desc[mode]} redacted."
     )
+
+
+def launch_gui():
+    """Launch the GUI interface."""
+    try:
+        from tkinter import Tk
+        from redactor_gui import RedactorGUI
+
+        root = Tk()
+        app = RedactorGUI(root)
+        app.run()
+    except ImportError as e:
+        print(f"Error: GUI dependencies not available. {e}")
+        print("Make sure redactor_gui.py is in the same directory.")
+        sys.exit(1)
+    except Exception as e:
+        print(f"Error launching GUI: {e}")
+        sys.exit(1)
+
+
+def main():
+    """Main entry point - launches GUI if no args, otherwise CLI."""
+    # Check if any arguments provided (excluding script name)
+    if len(sys.argv) == 1:
+        # No arguments - launch GUI
+        launch_gui()
+    else:
+        # Arguments provided - use CLI
+        cli_main()
 
 
 if __name__ == "__main__":
