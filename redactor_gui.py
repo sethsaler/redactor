@@ -40,8 +40,8 @@ class RedactorGUI:
     def __init__(self, root):
         self.root = root
         self.root.title("Document Redactor")
-        self.root.geometry("700x550")
-        self.root.minsize(600, 450)
+        self.root.geometry("700x640")
+        self.root.minsize(600, 520)
 
         # Set window icon (if available)
         try:
@@ -54,6 +54,7 @@ class RedactorGUI:
         self.files_var = StringVar()
         self.output_var = StringVar()
         self.recursive_var = BooleanVar(value=False)
+        self.pending_custom_phrases = ""
         self.running = False
         self.worker_thread = None
         self.update_queue = queue.Queue()
@@ -75,6 +76,7 @@ class RedactorGUI:
                     config = json.load(f)
                     self.output_var.set(config.get("last_output_dir", ""))
                     self.mode_var.set(config.get("last_mode", "bank"))
+                    self.pending_custom_phrases = config.get("custom_phrases_text", "")
             except:
                 pass
 
@@ -83,6 +85,7 @@ class RedactorGUI:
         config = {
             "last_output_dir": self.output_var.get(),
             "last_mode": self.mode_var.get(),
+            "custom_phrases_text": self.custom_phrases_text.get("1.0", "end").rstrip(),
         }
         try:
             with open(self.CONFIG_FILE, "w") as f:
@@ -170,6 +173,30 @@ class RedactorGUI:
                 padx=10,
                 pady=5,
             ).pack(anchor="w", pady=2)
+
+        # Custom phrases (optional)
+        custom_frame = Frame(main_frame)
+        custom_frame.pack(fill="both", expand=False, pady=(5, 10))
+
+        Label(
+            custom_frame,
+            text="Additional phrases to redact (optional, one per line):",
+            font=("Helvetica", 10, "bold"),
+        ).pack(anchor="w")
+
+        Label(
+            custom_frame,
+            text="Literal match, case-insensitive; combined with the mode above",
+            fg="gray",
+            font=("Helvetica", 9),
+        ).pack(anchor="w")
+
+        self.custom_phrases_text = scrolledtext.ScrolledText(
+            custom_frame, wrap="word", height=4, bg="#fafafa"
+        )
+        self.custom_phrases_text.pack(fill="both", expand=False, pady=(4, 0))
+        if self.pending_custom_phrases:
+            self.custom_phrases_text.insert("1.0", self.pending_custom_phrases)
 
         # Output Directory Section
         output_frame = Frame(main_frame)
@@ -359,6 +386,10 @@ class RedactorGUI:
         output_dir = self.output_var.get() or None
         recursive = self.recursive_var.get()
 
+        raw_phrases = self.custom_phrases_text.get("1.0", "end")
+        phrase_lines = [ln.strip() for ln in raw_phrases.splitlines() if ln.strip()]
+        custom_phrases = redactor.normalize_phrase_list(phrase_lines)
+
         files_to_process = []
 
         # Collect files
@@ -410,7 +441,11 @@ class RedactorGUI:
 
                 # Perform redaction
                 count = redactor.redact_file(
-                    file_path, output_path=output_path, mode=mode, verbose=False
+                    file_path,
+                    output_path=output_path,
+                    mode=mode,
+                    verbose=False,
+                    custom_phrases=custom_phrases,
                 )
 
                 total_redactions += count
@@ -434,18 +469,21 @@ class RedactorGUI:
             "bank": "bank-sensitive item(s)",
             "all": "item(s)",
         }
+        desc = mode_desc[mode]
+        if custom_phrases:
+            desc = f"{desc} and/or custom phrase(s)"
         if self.running:
             self.update_queue.put(
                 (
                     "complete",
-                    f"Complete: {total_files} file(s), {total_redactions} {mode_desc[mode]} redacted.",
+                    f"Complete: {total_files} file(s), {total_redactions} {desc} redacted.",
                 )
             )
         else:
             self.update_queue.put(
                 (
                     "complete",
-                    f"Cancelled. Processed {i - 1}/{total_files} files, {total_redactions} redacted.",
+                    f"Cancelled. Processed {i - 1}/{total_files} files, {total_redactions} {desc} redacted.",
                 )
             )
 
