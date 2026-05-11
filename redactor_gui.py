@@ -151,6 +151,13 @@ class RedactorGUI:
             anchor="w"
         )
 
+        Label(
+            mode_frame,
+            text="(Used only when the phrase box below is empty)",
+            fg="gray",
+            font=("Helvetica", 9),
+        ).pack(anchor="w")
+
         modes_frame = Frame(mode_frame)
         modes_frame.pack(fill="x", pady=5)
 
@@ -180,13 +187,14 @@ class RedactorGUI:
 
         Label(
             custom_frame,
-            text="Additional phrases to redact (optional, one per line):",
+            text="Phrases to redact only (optional):",
             font=("Helvetica", 10, "bold"),
         ).pack(anchor="w")
 
         Label(
             custom_frame,
-            text="Literal match, case-insensitive; combined with the mode above",
+            text="Comma- or newline-separated. If you enter anything here, only these "
+            "literals are redacted and the mode above is skipped. Case-insensitive.",
             fg="gray",
             font=("Helvetica", 9),
         ).pack(anchor="w")
@@ -387,8 +395,8 @@ class RedactorGUI:
         recursive = self.recursive_var.get()
 
         raw_phrases = self.custom_phrases_text.get("1.0", "end")
-        phrase_lines = [ln.strip() for ln in raw_phrases.splitlines() if ln.strip()]
-        custom_phrases = redactor.normalize_phrase_list(phrase_lines)
+        lines = [ln.strip() for ln in raw_phrases.splitlines() if ln.strip()]
+        custom_phrases = redactor.parse_user_phrase_inputs(lines)
 
         files_to_process = []
 
@@ -458,7 +466,12 @@ class RedactorGUI:
                         ("log", f"  ✓ Redacted {count} item(s) → {out_path.name}")
                     )
                 else:
-                    self.update_queue.put(("log", f"  ℹ No sensitive data found"))
+                    if custom_phrases:
+                        self.update_queue.put(
+                            ("log", f"  ℹ No matches for the listed phrase(s)")
+                        )
+                    else:
+                        self.update_queue.put(("log", f"  ℹ No sensitive data found"))
 
             except Exception as e:
                 self.update_queue.put(("error", f"  ✗ Error: {str(e)}"))
@@ -469,9 +482,10 @@ class RedactorGUI:
             "bank": "bank-sensitive item(s)",
             "all": "item(s)",
         }
-        desc = mode_desc[mode]
         if custom_phrases:
-            desc = f"{desc} and/or custom phrase(s)"
+            desc = "listed phrase occurrence(s)"
+        else:
+            desc = mode_desc[mode]
         if self.running:
             self.update_queue.put(
                 (
