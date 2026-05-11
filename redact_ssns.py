@@ -8,6 +8,9 @@ Modes:
   - all: Redact both SSNs and bank patterns
 
 For bank statements, currency amounts (e.g., $1,234.56, €500) are preserved.
+
+Optional custom phrases (CLI --phrase / --phrases-file, or GUI) are redacted in
+addition to the selected mode; matching is literal and case-insensitive.
 """
 
 import argparse
@@ -128,6 +131,66 @@ BANK_PATTERNS = [
 ]
 
 MIN_TEXT_LENGTH = 20
+
+
+# ============================================================================
+# CUSTOM PHRASES (user-supplied literals)
+# ============================================================================
+
+
+def normalize_phrase_list(phrases):
+    """Dedupe phrases while preserving order; strips whitespace. Case-insensitive dedup."""
+    if not phrases:
+        return []
+    seen = set()
+    out = []
+    for p in phrases:
+        if not p or not isinstance(p, str):
+            continue
+        s = p.strip()
+        if not s:
+            continue
+        key = s.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(s)
+    return out
+
+
+def load_phrases_from_file(path):
+    """Load newline-separated phrases; skip blanks and # comments."""
+    path = Path(path)
+    text = path.read_text(encoding="utf-8", errors="ignore")
+    out = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        out.append(line)
+    return out
+
+
+def find_custom_phrases_in_text(text, phrases):
+    """Find literal occurrences of user-supplied phrases (case-insensitive)."""
+    if not phrases:
+        return []
+    matches = []
+    seen_spans = set()
+    for phrase in phrases:
+        if not phrase or not isinstance(phrase, str):
+            continue
+        stripped = phrase.strip()
+        if not stripped:
+            continue
+        pat = re.compile(re.escape(stripped), re.IGNORECASE)
+        for m in pat.finditer(text):
+            span = (m.start(), m.end())
+            if span in seen_spans:
+                continue
+            seen_spans.add(span)
+            matches.append((m.group(), m.start(), m.end(), "custom"))
+    return matches
 
 
 # ============================================================================
@@ -285,15 +348,21 @@ def find_all_patterns_in_text(text):
     return ssn_matches + bank
 
 
-def find_matches_in_text(text, mode="ssn"):
-    """Find matches based on mode."""
+def find_matches_in_text(text, mode="ssn", custom_phrases=None):
+    """Find matches based on mode and optional user-supplied literal phrases."""
+    custom_phrases = normalize_phrase_list(custom_phrases or [])
+    custom = find_custom_phrases_in_text(text, custom_phrases)
+
     if mode == "ssn":
-        return [(raw, start, end, "ssn") for raw, start, end in find_ssns_in_text(text)]
+        base = [(raw, start, end, "ssn") for raw, start, end in find_ssns_in_text(text)]
     elif mode == "bank":
-        return find_bank_patterns_in_text(text)
+        base = find_bank_patterns_in_text(text)
     elif mode == "all":
-        return find_all_patterns_in_text(text)
-    return []
+        base = find_all_patterns_in_text(text)
+    else:
+        base = []
+
+    return base + custom
 
 
 # ============================================================================
@@ -301,11 +370,11 @@ def find_matches_in_text(text, mode="ssn"):
 # ============================================================================
 
 
-def redact_text_page(page, mode="ssn"):
+def redact_text_page(page, mode="ssn", custom_phrases=None):
     """Redact matches from a text-based PDF page."""
     count = 0
     text = page.get_text("text")
-    matches = find_matches_in_text(text, mode)
+    matches = find_matches_in_text(text, mode, custom_phrases)
 
     for raw, start, end, pattern_type in matches:
         instances = page.search_for(raw)
@@ -319,7 +388,7 @@ def redact_text_page(page, mode="ssn"):
     return count
 
 
-def redact_image_page(page, page_num, mode="ssn", dpi=300):
+def redact_image_page(page, page_num, mode="ssn", dpi=300, custom_phrases=None):
     """Redact matches from an image-based PDF page using OCR."""
     if not OCR_AVAILABLE:
         return 0
@@ -362,7 +431,7 @@ def redact_image_page(page, page_num, mode="ssn", dpi=300):
         if not word:
             continue
 
-        matches = find_matches_in_text(word, mode)
+        matches = find_matches_in_text(word, mode, custom_phrases)
         if not matches:
             continue
 
@@ -399,7 +468,7 @@ def is_text_page(page):
     return len(text) >= MIN_TEXT_LENGTH
 
 
-def redact_pdf(pdf_path, output_path=None, mode="ssn", verbose=False):
+def redact_pdf(pdf_path, output_path=None, mode="ssn", verbose=False, custom_phrases=None):
     """Redact a PDF file."""
     if not PDF_AVAILABLE:
         print("Error: PyMuPDF not installed. Cannot process PDF.")
@@ -416,12 +485,14 @@ def redact_pdf(pdf_path, output_path=None, mode="ssn", verbose=False):
         page = doc[page_num]
 
         if is_text_page(page):
-            count = redact_text_page(page, mode=mode)
+            count = redact_text_page(page, mode=mode, custom_phrases=custom_phrases)
             if verbose and count:
                 print(f"  Page {page_num + 1}: redacted {count} item(s) (text)")
             total_redacted += count
         else:
-            count = redact_image_page(page, page_num, mode=mode)
+            count = redact_image_page(
+                page, page_num, mode=mode, custom_phrases=custom_phrases
+            )
             if verbose and count:
                 print(f"  Page {page_num + 1}: redacted {count} item(s) (OCR)")
             total_redacted += count
@@ -437,7 +508,7 @@ def redact_pdf(pdf_path, output_path=None, mode="ssn", verbose=False):
 # ============================================================================
 
 
-def redact_text_file(text_path, output_path=None, mode="ssn"):
+def redact_text_file(text_path, output_path=None, mode="ssn", custom_phrases=None):
     """Redact a plain text file using regex substitution."""
     text_path = Path(text_path)
     if output_path is None:
@@ -446,24 +517,12 @@ def redact_text_file(text_path, output_path=None, mode="ssn"):
         )
 
     content = text_path.read_text(encoding="utf-8", errors="ignore")
-    original_content = content
     redaction_count = 0
 
-    if mode == "ssn":
-        matches = find_ssns_in_text(content)
-        for raw, start, end in sorted(matches, key=lambda x: x[1], reverse=True):
-            content = content[:start] + "[REDACTED]" + content[end:]
-            redaction_count += 1
-    elif mode == "bank":
-        matches = find_bank_patterns_in_text(content)
-        for raw, start, end, _ in sorted(matches, key=lambda x: x[1], reverse=True):
-            content = content[:start] + "[REDACTED]" + content[end:]
-            redaction_count += 1
-    elif mode == "all":
-        matches = find_all_patterns_in_text(content)
-        for raw, start, end, _ in sorted(matches, key=lambda x: x[1], reverse=True):
-            content = content[:start] + "[REDACTED]" + content[end:]
-            redaction_count += 1
+    matches = find_matches_in_text(content, mode, custom_phrases)
+    for raw, start, end, _ in sorted(matches, key=lambda x: x[1], reverse=True):
+        content = content[:start] + "[REDACTED]" + content[end:]
+        redaction_count += 1
 
     output_path.write_text(content, encoding="utf-8")
     return redaction_count
@@ -474,7 +533,7 @@ def redact_text_file(text_path, output_path=None, mode="ssn"):
 # ============================================================================
 
 
-def redact_csv_file(csv_path, output_path=None, mode="ssn"):
+def redact_csv_file(csv_path, output_path=None, mode="ssn", custom_phrases=None):
     """Redact a CSV file by processing cell values."""
     csv_path = Path(csv_path)
     if output_path is None:
@@ -496,7 +555,7 @@ def redact_csv_file(csv_path, output_path=None, mode="ssn"):
     for row in rows:
         redacted_row = []
         for cell in row:
-            redacted_cell, count = redact_cell(cell, mode)
+            redacted_cell, count = redact_cell(cell, mode, custom_phrases)
             redaction_count += count
             redacted_row.append(redacted_cell)
         redacted_rows.append(redacted_row)
@@ -508,38 +567,18 @@ def redact_csv_file(csv_path, output_path=None, mode="ssn"):
     return redaction_count
 
 
-def redact_cell(cell, mode="ssn"):
+def redact_cell(cell, mode="ssn", custom_phrases=None):
     """Redact sensitive patterns in a single cell value."""
     if not cell or not isinstance(cell, str):
         return cell, 0
 
+    matches = find_matches_in_text(cell, mode, custom_phrases)
+    result = cell
     redaction_count = 0
-
-    if mode == "ssn":
-        matches = find_ssns_in_text(cell)
-        result = cell
-        for raw, start, end in sorted(matches, key=lambda x: x[1], reverse=True):
-            result = result[:start] + "[REDACTED]" + result[end:]
-            redaction_count += 1
-        return result, redaction_count
-
-    elif mode == "bank":
-        matches = find_bank_patterns_in_text(cell)
-        result = cell
-        for raw, start, end, _ in sorted(matches, key=lambda x: x[1], reverse=True):
-            result = result[:start] + "[REDACTED]" + result[end:]
-            redaction_count += 1
-        return result, redaction_count
-
-    elif mode == "all":
-        matches = find_all_patterns_in_text(cell)
-        result = cell
-        for raw, start, end, _ in sorted(matches, key=lambda x: x[1], reverse=True):
-            result = result[:start] + "[REDACTED]" + result[end:]
-            redaction_count += 1
-        return result, redaction_count
-
-    return cell, 0
+    for raw, start, end, _ in sorted(matches, key=lambda x: x[1], reverse=True):
+        result = result[:start] + "[REDACTED]" + result[end:]
+        redaction_count += 1
+    return result, redaction_count
 
 
 # ============================================================================
@@ -547,7 +586,7 @@ def redact_cell(cell, mode="ssn"):
 # ============================================================================
 
 
-def redact_excel_file(excel_path, output_path=None, mode="ssn"):
+def redact_excel_file(excel_path, output_path=None, mode="ssn", custom_phrases=None):
     """Redact an Excel (.xlsx) file by processing cell values."""
     if not EXCEL_AVAILABLE:
         print("Error: openpyxl not installed. Cannot process Excel files.")
@@ -567,7 +606,9 @@ def redact_excel_file(excel_path, output_path=None, mode="ssn"):
         for row in sheet.iter_rows():
             for cell in row:
                 if cell.value and isinstance(cell.value, str):
-                    redacted_value, count = redact_cell(cell.value, mode)
+                    redacted_value, count = redact_cell(
+                        cell.value, mode, custom_phrases
+                    )
                     redaction_count += count
                     cell.value = redacted_value
 
@@ -596,19 +637,19 @@ def detect_file_type(file_path):
     return "unknown"
 
 
-def redact_file(file_path, output_path=None, mode="ssn", verbose=False):
+def redact_file(file_path, output_path=None, mode="ssn", verbose=False, custom_phrases=None):
     """Redact a single file based on its type."""
     file_path = Path(file_path)
     file_type = detect_file_type(file_path)
 
     if file_type == "pdf":
-        return redact_pdf(file_path, output_path, mode, verbose)
+        return redact_pdf(file_path, output_path, mode, verbose, custom_phrases)
     elif file_type == "txt":
-        return redact_text_file(file_path, output_path, mode)
+        return redact_text_file(file_path, output_path, mode, custom_phrases)
     elif file_type == "csv":
-        return redact_csv_file(file_path, output_path, mode)
+        return redact_csv_file(file_path, output_path, mode, custom_phrases)
     elif file_type == "excel":
-        return redact_excel_file(file_path, output_path, mode)
+        return redact_excel_file(file_path, output_path, mode, custom_phrases)
     elif file_type == "unsupported":
         print(
             f"  Skipping {file_path.name}: Legacy .xls format not supported (convert to .xlsx)"
@@ -640,6 +681,8 @@ Examples:
   python redact_ssns.py document.pdf
   python redact_ssns.py statement.pdf --mode bank
   python redact_ssns.py data/ --recursive --mode all -o ./redacted/
+  python redact_ssns.py memo.txt --phrase "Project X" --phrase "Acme Corp"
+  python redact_ssns.py report.pdf --phrases-file ./phrases.txt --mode bank
         """,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -670,6 +713,21 @@ Examples:
         action="store_true",
         help="Launch GUI mode (default when no arguments provided)",
     )
+    parser.add_argument(
+        "-p",
+        "--phrase",
+        action="append",
+        default=[],
+        metavar="TEXT",
+        help="Additional word or phrase to redact (repeatable); case-insensitive literal match",
+    )
+    parser.add_argument(
+        "--phrases-file",
+        type=Path,
+        default=None,
+        metavar="PATH",
+        help="Newline-separated extra phrases (# starts a comment line)",
+    )
 
     args = parser.parse_args()
 
@@ -680,6 +738,14 @@ Examples:
 
     target = args.path
     mode = args.mode
+
+    extra_phrases = list(args.phrase)
+    if args.phrases_file:
+        if not args.phrases_file.is_file():
+            print(f"Phrases file not found: {args.phrases_file}")
+            sys.exit(1)
+        extra_phrases.extend(load_phrases_from_file(args.phrases_file))
+    custom_phrases = normalize_phrase_list(extra_phrases)
 
     # Check dependencies based on file types we'll process
     if not PDF_AVAILABLE:
@@ -730,7 +796,13 @@ Examples:
         if args.verbose:
             print(f"Processing: {file}")
 
-        count = redact_file(file, output_path=output, mode=mode, verbose=args.verbose)
+        count = redact_file(
+            file,
+            output_path=output,
+            mode=mode,
+            verbose=args.verbose,
+            custom_phrases=custom_phrases,
+        )
         total_files += 1
         total_redactions += count
 
@@ -744,8 +816,11 @@ Examples:
         print(f"  {file.name}: {status} -> {final_output}")
 
     mode_desc = {"ssn": "SSN(s)", "bank": "bank-sensitive item(s)", "all": "item(s)"}
+    desc = mode_desc[mode]
+    if custom_phrases:
+        desc = f"{desc} and/or custom phrase(s)"
     print(
-        f"\nDone: {total_files} file(s) processed, {total_redactions} {mode_desc[mode]} redacted."
+        f"\nDone: {total_files} file(s) processed, {total_redactions} {desc} redacted."
     )
 
 
