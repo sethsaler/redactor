@@ -9,8 +9,10 @@ Modes:
 
 For bank statements, currency amounts (e.g., $1,234.56, €500) are preserved.
 
-Optional custom phrases (CLI --phrase / --phrases-file, or GUI) are redacted in
-addition to the selected mode; matching is literal and case-insensitive.
+Optional custom phrases (CLI --phrase / --phrases-file, or GUI) use a separate
+pass: when any phrase is given, only those literals are redacted (SSN/bank/all
+patterns are skipped). Comma-separated lists are split into separate phrases.
+Matching is literal and case-insensitive.
 """
 
 import argparse
@@ -18,6 +20,7 @@ import csv
 import io
 import re
 import sys
+from itertools import groupby
 from pathlib import Path
 
 # PDF support
@@ -156,6 +159,22 @@ def normalize_phrase_list(phrases):
         seen.add(key)
         out.append(s)
     return out
+
+
+def parse_user_phrase_inputs(raw_strings):
+    """Split comma-separated entries and normalize (order preserved, deduped)."""
+    expanded = []
+    for raw in raw_strings or []:
+        if not isinstance(raw, str):
+            continue
+        raw = raw.strip()
+        if not raw:
+            continue
+        for part in raw.split(","):
+            p = part.strip()
+            if p:
+                expanded.append(p)
+    return normalize_phrase_list(expanded)
 
 
 def load_phrases_from_file(path):
@@ -349,20 +368,18 @@ def find_all_patterns_in_text(text):
 
 
 def find_matches_in_text(text, mode="ssn", custom_phrases=None):
-    """Find matches based on mode and optional user-supplied literal phrases."""
+    """Find matches: if custom_phrases is non-empty, only those literals; else mode patterns."""
     custom_phrases = normalize_phrase_list(custom_phrases or [])
-    custom = find_custom_phrases_in_text(text, custom_phrases)
+    if custom_phrases:
+        return find_custom_phrases_in_text(text, custom_phrases)
 
     if mode == "ssn":
-        base = [(raw, start, end, "ssn") for raw, start, end in find_ssns_in_text(text)]
+        return [(raw, start, end, "ssn") for raw, start, end in find_ssns_in_text(text)]
     elif mode == "bank":
-        base = find_bank_patterns_in_text(text)
+        return find_bank_patterns_in_text(text)
     elif mode == "all":
-        base = find_all_patterns_in_text(text)
-    else:
-        base = []
-
-    return base + custom
+        return find_all_patterns_in_text(text)
+    return []
 
 
 # ============================================================================
@@ -388,10 +405,103 @@ def redact_text_page(page, mode="ssn", custom_phrases=None):
     return count
 
 
+def _redact_ocr_lines_custom_phrases(
+    page, img_w, img_h, page_rect, data, custom_phrases
+):
+    """Redact custom phrases on OCR output by matching within each text line."""
+    scale_x = page_rect.width / img_w
+    scale_y = page_rect.height / img_h
+    count = 0
+    n_boxes = len(data["text"])
+
+    row_indices = []
+    for i in range(n_boxes):
+        if not (data["text"][i] or "").strip():
+            continue
+        row_indices.append(i)
+
+    row_indices.sort(
+        key=lambda i: (
+            data["block_num"][i],
+            data["par_num"][i],
+            data["line_num"][i],
+            data["word_num"][i],
+        )
+    )
+
+    for _key, grp in groupby(
+        row_indices,
+        key=lambda i: (
+            data["block_num"][i],
+            data["par_num"][i],
+            data["line_num"][i],
+        ),
+    ):
+        idxs = list(grp)
+        words = [(data["text"][i] or "").strip() for i in idxs]
+        line_text = " ".join(words)
+        if not line_text:
+            continue
+
+        word_ranges = []
+        pos = 0
+        for wi, w in enumerate(words):
+            s = pos
+            e = pos + len(w)
+            word_ranges.append((s, e))
+            pos = e
+            if wi < len(words) - 1:
+                pos += 1
+
+        for phrase in custom_phrases:
+            pat = re.compile(re.escape(phrase), re.IGNORECASE)
+            for m in pat.finditer(line_text):
+                ms, me = m.span()
+                min_x = min_y = None
+                max_x = max_y = None
+                for j, (ws, we) in enumerate(word_ranges):
+                    if we <= ms or ws >= me:
+                        continue
+                    i = idxs[j]
+                    x = data["left"][i]
+                    y = data["top"][i]
+                    w = data["width"][i]
+                    h = data["height"][i]
+                    if min_x is None:
+                        min_x, min_y, max_x, max_y = x, y, x + w, y + h
+                    else:
+                        min_x = min(min_x, x)
+                        min_y = min(min_y, y)
+                        max_x = max(max_x, x + w)
+                        max_y = max(max_y, y + h)
+                if min_x is None:
+                    continue
+
+                pdf_x0 = min_x * scale_x
+                pdf_y0 = min_y * scale_y
+                pdf_x1 = max_x * scale_x
+                pdf_y1 = max_y * scale_y
+                pad_w = (pdf_x1 - pdf_x0) * 0.15
+                pad_h = (pdf_y1 - pdf_y0) * 0.15
+                pad = max(pad_w, pad_h, 3)
+                rect = fitz.Rect(
+                    pdf_x0 - pad,
+                    pdf_y0 - pad,
+                    pdf_x1 + pad,
+                    pdf_y1 + pad,
+                )
+                page.add_redact_annot(rect, fill=(0, 0, 0))
+                count += 1
+
+    return count
+
+
 def redact_image_page(page, page_num, mode="ssn", dpi=300, custom_phrases=None):
     """Redact matches from an image-based PDF page using OCR."""
     if not OCR_AVAILABLE:
         return 0
+
+    custom_norm = normalize_phrase_list(custom_phrases or [])
 
     count = 0
     try:
@@ -425,36 +535,41 @@ def redact_image_page(page, page_num, mode="ssn", dpi=300, custom_phrases=None):
         print("  Warning: Tesseract OCR not installed. Skipping image-based page.")
         return 0
 
-    n_boxes = len(data["text"])
-    for i in range(n_boxes):
-        word = data["text"][i].strip()
-        if not word:
-            continue
-
-        matches = find_matches_in_text(word, mode, custom_phrases)
-        if not matches:
-            continue
-
-        x = data["left"][i]
-        y = data["top"][i]
-        w = data["width"][i]
-        h = data["height"][i]
-
-        pdf_x = x * scale_x
-        pdf_y = y * scale_y
-        pdf_w = w * scale_x
-        pdf_h = h * scale_y
-
-        padding = max(pdf_w * 0.15, 3)
-        rect = fitz.Rect(
-            pdf_x - padding,
-            pdf_y - padding,
-            pdf_x + pdf_w + padding,
-            pdf_y + pdf_h + padding,
+    if custom_norm:
+        count = _redact_ocr_lines_custom_phrases(
+            page, img_w, img_h, page_rect, data, custom_norm
         )
+    else:
+        n_boxes = len(data["text"])
+        for i in range(n_boxes):
+            word = data["text"][i].strip()
+            if not word:
+                continue
 
-        page.add_redact_annot(rect, fill=(0, 0, 0))
-        count += 1
+            matches = find_matches_in_text(word, mode, None)
+            if not matches:
+                continue
+
+            x = data["left"][i]
+            y = data["top"][i]
+            w = data["width"][i]
+            h = data["height"][i]
+
+            pdf_x = x * scale_x
+            pdf_y = y * scale_y
+            pdf_w = w * scale_x
+            pdf_h = h * scale_y
+
+            padding = max(pdf_w * 0.15, 3)
+            rect = fitz.Rect(
+                pdf_x - padding,
+                pdf_y - padding,
+                pdf_x + pdf_w + padding,
+                pdf_y + pdf_h + padding,
+            )
+
+            page.add_redact_annot(rect, fill=(0, 0, 0))
+            count += 1
 
     if count > 0:
         page.apply_redactions()
@@ -670,19 +785,21 @@ def cli_main():
     parser = argparse.ArgumentParser(
         description="Redact sensitive information from documents (PDF, CSV, TXT, XLSX).",
         epilog="""
-Modes:
+Modes (used only when no phrases are given):
   ssn  - Redact Social Security Numbers only (default)
   bank - Redact numbers (except currency amounts), emails, phones, names, addresses
   all  - Redact both SSNs and bank patterns
 
-Currency amounts (e.g. $1,234.56, €500) are preserved in bank mode.
+When --phrase or --phrases-file is set, only those literals are redacted (mode is ignored).
+Comma-separated values split into separate phrases. Currency amounts (e.g. $1,234.56, €500)
+are preserved in bank mode.
 
 Examples:
   python redact_ssns.py document.pdf
   python redact_ssns.py statement.pdf --mode bank
   python redact_ssns.py data/ --recursive --mode all -o ./redacted/
-  python redact_ssns.py memo.txt --phrase "Project X" --phrase "Acme Corp"
-  python redact_ssns.py report.pdf --phrases-file ./phrases.txt --mode bank
+  python redact_ssns.py memo.txt --phrase "Project X, Acme Corp"
+  python redact_ssns.py report.pdf --phrases-file ./phrases.txt
         """,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -706,7 +823,7 @@ Examples:
         "--mode",
         choices=["ssn", "bank", "all"],
         default="ssn",
-        help="Redaction mode (default: ssn)",
+        help="Redaction mode when no phrases are given (default: ssn)",
     )
     parser.add_argument(
         "--gui",
@@ -719,14 +836,14 @@ Examples:
         action="append",
         default=[],
         metavar="TEXT",
-        help="Additional word or phrase to redact (repeatable); case-insensitive literal match",
+        help="Word or phrase to redact only (repeatable); comma-separated splits into multiple; case-insensitive literal match; if set, mode patterns are skipped",
     )
     parser.add_argument(
         "--phrases-file",
         type=Path,
         default=None,
         metavar="PATH",
-        help="Newline-separated extra phrases (# starts a comment line)",
+        help="Phrases file: each line is one or more comma-separated phrases (# starts a comment); if set, mode patterns are skipped",
     )
 
     args = parser.parse_args()
@@ -739,13 +856,13 @@ Examples:
     target = args.path
     mode = args.mode
 
-    extra_phrases = list(args.phrase)
+    chunks = list(args.phrase)
     if args.phrases_file:
         if not args.phrases_file.is_file():
             print(f"Phrases file not found: {args.phrases_file}")
             sys.exit(1)
-        extra_phrases.extend(load_phrases_from_file(args.phrases_file))
-    custom_phrases = normalize_phrase_list(extra_phrases)
+        chunks.extend(load_phrases_from_file(args.phrases_file))
+    custom_phrases = parse_user_phrase_inputs(chunks)
 
     # Check dependencies based on file types we'll process
     if not PDF_AVAILABLE:
@@ -816,9 +933,10 @@ Examples:
         print(f"  {file.name}: {status} -> {final_output}")
 
     mode_desc = {"ssn": "SSN(s)", "bank": "bank-sensitive item(s)", "all": "item(s)"}
-    desc = mode_desc[mode]
     if custom_phrases:
-        desc = f"{desc} and/or custom phrase(s)"
+        desc = "listed phrase occurrence(s)"
+    else:
+        desc = mode_desc[mode]
     print(
         f"\nDone: {total_files} file(s) processed, {total_redactions} {desc} redacted."
     )
